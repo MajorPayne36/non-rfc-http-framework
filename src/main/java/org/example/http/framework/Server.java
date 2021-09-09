@@ -1,24 +1,26 @@
 package org.example.http.framework;
 
+import io.github.classgraph.ClassGraph;
 import lombok.extern.java.Log;
-import org.example.http.framework.exception.MalformedRequestException;
-import org.example.http.framework.exception.RequestBodyTooLarge;
-import org.example.http.framework.exception.RequestHandleException;
-import org.example.http.framework.exception.ServerException;
+import org.example.http.framework.annotation.RequestMapping;
+import org.example.http.framework.exception.*;
 import org.example.http.framework.guava.Bytes;
+import org.example.http.framework.resolver.argument.HandlerMethodArgumentResolver;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Parameter;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Optional;
+import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
 import java.util.logging.Level;
 import java.util.stream.Collectors;
 
@@ -28,9 +30,13 @@ public class Server {
   private static final byte[] CRLFCRLF = new byte[]{'\r', '\n', '\r', '\n'};
   private final static int headersLimit = 4096;
   private final static long bodyLimit = 10 * 1024 * 1024;
-  private final ExecutorService service = Executors.newFixedThreadPool(64);
+  private final ExecutorService service = Executors.newFixedThreadPool(64, r -> {
+    final var thread = new Thread(r);
+    thread.setDaemon(true);
+    return thread;
+  });
   // GET, "/search", handler
-  private final Map<String, Map<String, Handler>> routes = new HashMap<>();
+  private final Map<String, Map<String, HandlerMethod>> routes = new HashMap<>();
   // 404 Not Found ->
   // 500 Internal Server error ->
   private final Handler notFoundHandler = (request, response) -> {
@@ -71,31 +77,63 @@ public class Server {
       throw new RequestHandleException(e);
     }
   };
+  private final List<HandlerMethodArgumentResolver> argumentResolvers = new ArrayList<>();
 
   // state -> NOT_STARTED, STARTED, STOP, STOPPED
   private volatile boolean stop = false;
 
   public void get(String path, Handler handler) {
-    register(HttpMethods.GET, path, handler);
+    registerHandler(HttpMethods.GET, path, handler);
   }
 
   public void post(String path, Handler handler) {
-    register(HttpMethods.POST, path, handler);
+    registerHandler(HttpMethods.POST, path, handler);
   }
 
-  public synchronized void register(String method, String path, Handler handler) {
-    Optional.ofNullable(routes.get(method))
-        .ifPresentOrElse(
-            map -> map.put(path, handler),
-            () -> routes.put(method, new HashMap<>(Map.of(path, handler)))
-        );
+  public void autoRegisterHandlers(String pkg) {
+    try (final var scanResult = new ClassGraph().enableAllInfo().acceptPackages(pkg).scan()) {
+      for (final var classInfo : scanResult.getClassesWithMethodAnnotation(RequestMapping.class.getName())) {
+        final var handler = classInfo.loadClass().getConstructor().newInstance();
+        for (final var method : handler.getClass().getMethods()) {
+          if (method.isAnnotationPresent(RequestMapping.class)) {
+            final RequestMapping mapping = method.getAnnotation(RequestMapping.class);
 
+            final var handlerMethod = new HandlerMethod(handler, method);
+            Optional.ofNullable(routes.get(mapping.method()))
+                .ifPresentOrElse(
+                    map -> map.put(mapping.path(), handlerMethod),
+                    () -> routes.put(mapping.method(), new HashMap<>(Map.of(mapping.path(), handlerMethod)))
+                );
+          }
+        }
+      }
+    } catch (InvocationTargetException | InstantiationException | IllegalAccessException | NoSuchMethodException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  public void registerHandler(String method, String path, Handler handler) {
+    try {
+      final var handle = handler.getClass().getMethod("handle", Request.class, OutputStream.class);
+      final var handlerMethod = new HandlerMethod(handler, handle);
+      Optional.ofNullable(routes.get(method))
+          .ifPresentOrElse(
+              map -> map.put(path, handlerMethod),
+              () -> routes.put(method, new HashMap<>(Map.of(path, handlerMethod)))
+          );
+    } catch (NoSuchMethodException e) {
+      throw new HandlerRegistrationException(e);
+    }
 //    final var map = routes.get(method);
 //    if (map != null) {
 //      map.put(path, handler);
 //      return;
 //    }
 //    routes.put(method, new HashMap<>(Map.of(path, handler)));
+  }
+
+  public void addArgumentResolver(HandlerMethodArgumentResolver... resolvers) {
+    argumentResolvers.addAll(List.of(resolvers));
   }
 
   public void listen(int port) {
@@ -179,6 +217,7 @@ public class Server {
         in.skipNBytes(headersEndIndex);
         final var body = in.readNBytes(contentLength);
 
+        // TODO: annotation monkey
         final var request = Request.builder()
             .method(method)
             .path(uri)
@@ -188,12 +227,33 @@ public class Server {
 
         final var response = out;
 
-        final var handler = Optional.ofNullable(routes.get(request.getMethod()))
+        final var handlerMethod = Optional.ofNullable(routes.get(request.getMethod()))
             .map(o -> o.get(request.getPath()))
-            .orElse(notFoundHandler);
+            .orElse(new HandlerMethod(notFoundHandler, notFoundHandler.getClass().getMethod("handle", Request.class, OutputStream.class)));
 
         try {
-          handler.handle(request, response);
+          final var invokableMethod = handlerMethod.getMethod();
+          final var invokableHandler = handlerMethod.getHandler();
+
+          final var arguments = new ArrayList<>(invokableMethod.getParameterCount());
+          for (final var parameter : invokableMethod.getParameters()) {
+            var resolved = false;
+            for (final var argumentResolver : argumentResolvers) {
+              if (!argumentResolver.supportsParameter(parameter)) {
+                continue;
+              }
+
+              final var argument = argumentResolver.resolveArgument(parameter, request, response);
+              arguments.add(argument);
+              resolved = true;
+              break;
+            }
+            if (!resolved) {
+              throw new UnsupportedParameterException(parameter.getType().getName());
+            }
+          }
+
+          invokableMethod.invoke(invokableHandler, arguments.toArray());
         } catch (Exception e) {
           internalErrorHandler.handle(request, response);
         }
@@ -212,9 +272,13 @@ public class Server {
                     html
             ).getBytes(StandardCharsets.UTF_8)
         );
+      } catch (NoSuchMethodException e) {
+        e.printStackTrace();
+        // TODO:
       }
     } catch (IOException e) {
       e.printStackTrace();
+      // TODO:
     }
   }
 }

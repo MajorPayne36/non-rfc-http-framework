@@ -105,6 +105,7 @@ Content-Type: image/png
 ###
 
 GET http://localhost:9999/courses
+Username: admin
 
 ###
 
