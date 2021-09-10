@@ -6,6 +6,9 @@ import org.example.http.framework.resolver.argument.RequestHandlerMethodArgument
 import org.example.http.framework.resolver.argument.RequestHeaderHandlerMethodArgumentResolver;
 import org.example.http.framework.resolver.argument.ResponseHandlerMethodArgumentResolver;
 
+import java.io.IOException;
+import java.util.logging.Level;
+
 @Log
 public class Main {
   public static void main(String[] args) {
@@ -17,13 +20,14 @@ public class Main {
         new RequestHeaderHandlerMethodArgumentResolver()
     );
     new Thread(() -> {
-      try {
-        Thread.sleep(1000);
-        server.stop();
-      } catch (InterruptedException e) {
-        e.printStackTrace();
-      }
+        try {
+            Thread.sleep(1000);
+            server.stop();
+            log.log(Level.INFO, "server stopped");
+        } catch (InterruptedException | IOException e) {
+            e.printStackTrace();
+        }
     }).start();
-    server.listen(9999);
-  }
+        server.listen(9999);
+    }
 }
