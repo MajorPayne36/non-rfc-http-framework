@@ -149,7 +149,7 @@ public class Server {
                 service.submit(() -> handle(socket));
             }
         } catch (SocketException e) {
-            e.printStackTrace();
+            throw new ServerException("socket server has been stopped");
         } catch (IOException e) {
             throw new ServerException(e);
         }
